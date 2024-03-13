@@ -27,14 +27,23 @@ The core extension of the Raft algorithm resides within the `etcd-io/raft` libra
 
 etcd itself serves as a prime example of an application that leverages the witness functionality. It provides its own implementation for witness storage, along with functionalities specifically designed for witness management.
 
-![etcd with witness](./etcd-witness.png)
+|![Component diagram of etcd with witness](./etcd-witness-component.svg)|
+|:--:|
+| *Component diagram of etcd with witness* |
+
+
+|![Data flow in etcd with witness](./etcd-witness-flow.svg)|
+|:--:|
+| *Data flow in etcd with witness* |
 
 
 
 ## Raft
 We amended etcd-io/raft library to implement **extended Raft algorithm**. 
 
-![Extend etcd-io/raft library to support witness](./extended-raft-class.png)
+|![Class diagram of the extend etcd-io/raft library](./extended-raft-class.svg)|
+|:--:|
+| *Class diagram of the extend etcd-io/raft library* | 
 
 ### Witness Message
 In our system, witness messages are treated differently from other messages sent within the network. The rationale behind this distinction lies in the fact that witness messages are processed locally, eliminating the need for marshaling and transmission over the wire.
@@ -335,12 +344,18 @@ The results, as illustrated in the accompanying graphs, demonstrate that the clu
 
 When a follower node is intentionally brought down, both cluster configurations (with and without witness) exhibit 100% availability. However, the cluster utilizing a witness demonstrates a potential performance advantage. This is because, in this scenario, data only needs to be persisted on the leader node to be considered committed, streamlining the write process.
 
-![Follower down](./follower-down-comparison.png)
+|![Follower down](./follower-down-comparison.png)|
+|:--:|
+| *Follower down* |
 
 When we bring down leader, both cluster elected new leader immediately. The availability is not impacted in both clusters. 
 
-![Leader down](./leader-down-comparison.png)
+|![Leader down](./leader-down-comparison.png)|
+|:--:|
+| *Leader down* |
 
 During a network partition, both clusters experience a minor decrease in availability. This occurs because workloads are distributed across all etcd nodes, resulting in failed requests on nodes within the isolated partition. Conversely, we observe a significant increase in the throughput curve. This spike reflects the accumulated requests that are retried once the network partition is resolved. Notably, workloads directed to the leader node continue to be served successfully. In an ideal scenario where all workloads are routed to the leader during a partition, availability would remain unaffected.
 
-![Network partition](./network-partition-comparison.png)
+|![Network partition](./network-partition-comparison.png)|
+|:--:|
+| *Network partition* |
