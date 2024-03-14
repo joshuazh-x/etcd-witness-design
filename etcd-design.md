@@ -9,14 +9,15 @@ While the requirement for an odd cluster size isn't problematic for large-scale 
 Enabling witness support in etcd would allow Kubernetes clusters to operate with fewer machines while maintaining comparable availability to current configurations. This is a significant benefit for budget-conscious users. Witnesses act as tie-breakers in case of network issues, ensuring a functional quorum can still be formed even with an even number of servers.
 
 # Goal
-etcd leverages a separate shared library, `etcd-io/raft`, for the core Raft consensus algorithm. This modular design makes the library reusable by other applications. Our changes to support witnesses in etcd will not only benefit etcd itself, but also extend these advantages to applications that rely on the `etcd-io/raft` library.
-Thereby the design of witness functionality in etcd has two key objectives:
-1. Extend the `etcd-io/raft` library to support witness functionality through an [extended Raft algorithm](https://github.com/joshuazh-x/extended-raft-paper/blob/main/main.pdf).  
-2. Build etcd's capability to leverage various witness types. Currently, we support mounted share and cloud witness options, with the potential to expand to include additional solutions like AWS S3. This design philosophy prioritizes flexibility to meet diverse user requirements.
+Etcd leverages a modular design by relying on the separate shared library `etcd-io/raft` for its core Raft consensus algorithm. This modularity allows other applications to reuse the robust Raft library. While etcd itself is widely used (e.g., Kubernetes), this design offers more than just witness support for etcd clusters.
 
-A fundamental principle for witness functionality is to ensure complete backward compatibility with existing Raft libraries and etcd behavior. In essence, without a witness present, etcd and Raft will operate identically to the official versions. This compatibility extends to both API and data levels. As a result, existing applications reliant on etcd will continue to operate seamlessly even after upgrading to the new version with witness support. 
+1. This new design enables etcd to create highly available clusters by incorporating a witness in place of a traditional member node. Traditionally, a 3-node etcd cluster could be reduced to just 2 active nodes with a shared storage like NFS or Azure Blob acting as the witness.
 
-It is also important to seamless upgrade of existing clusters to a witness-enabled version and, if necessary, downgrade to a previous official version for users with specific concerns.
+1. Backward compatibility with existing etcd deployments (vanilla etcd) is a critical aspect. This includes compatibility on both the API level and backend data level. Maintaining compatibility ensures that existing applications reliant on etcd continue to function seamlessly. Additionally, backend data compatibility preserves management and operation experience like recovering from old snapshots.
+
+1. The `etcd-io/raft` library is extended to support witness functionality through a compatible variant of the Raft algorithm, as detailed in the extended Raft algorithm paper ([extended Raft algorithm](https://github.com/joshuazh-x/extended-raft-paper/blob/main/main.pdf)). This ensures that the extended Raft algorithm remains fully compatible with the vanilla version. By maintaining API and behavior compatibility throughout the implementation, applications built on raft library can continue to function as expected.
+
+It is also important to seamless upgrade of existing clusters to a witness-enabled version and, if necessary, downgrade to a previous vanilla version for users with specific concerns.
 
 # Design
 
@@ -62,7 +63,7 @@ The replication set represents a subset of the voter set in the current configur
 The `ProgressTracker` maintains its own epoch and is capable of changing the replication sets based on its view of peer voters. This functionality is achieved through two member functions:
 
 1. `ResetReplicationSet`: This function re-initializes the replication sets in the current epoch to their corresponding non-witness voter set. The subterm is either reset to 0 or incremented by one, depending on the `resetSubterm` argument.
-2. `ChangeReplicationSet`: This function allows dynamic adjustments to the replication sets based on changes in the view of peer voters.
+1. `ChangeReplicationSet`: This function allows dynamic adjustments to the replication sets based on changes in the view of peer voters.
 
 The leader’s replication set undergoes specific handling:
 
@@ -73,23 +74,42 @@ The leader’s replication set undergoes specific handling:
 The `ChangeReplicationSet` function dynamically modifies the replication sets within the current epoch based on the health status of voters in each configuration. The goal is to create a new replication set that includes more healthy voters. Here are the key principles governing this process:
 
 1. Excluded Voter Health: If the excluded voter is not healthy, swapping it with any voter already inside the replication set will not increase the number of healthy voters in the set.
-2. Maximizing Healthy Voters: When the excluded voter is a healthy voter, we can replace it with any non-healthy voter from the replication set to maximize the count of healthy voters within the replication set. Notably, witnesses are always considered healthy.
-3. All Healthy Voters: If all voters in the replication set are healthy, no changes are made to the set.
-4. Witness Exception: An exception occurs when all voters are healthy, and the replication set contains a witness. In this scenario, we reset the replication set to include only non-witness voters.
+1. Maximizing Healthy Voters: When the excluded voter is a healthy voter, we can replace it with any non-healthy voter from the replication set to maximize the count of healthy voters within the replication set. Notably, witnesses are always considered healthy.
+1. All Healthy Voters: If all voters in the replication set are healthy, no changes are made to the set.
+1. Witness Exception: An exception occurs when all voters are healthy, and the replication set contains a witness. In this scenario, we reset the replication set to include only non-witness voters.
 
 Two new essential member functions have been introduced in the `ProgressTracker`:
 
 1. `OneLessThanQuorumInReplicationSet`: This function plays an important role in log replication. It determines when the leader should send requests to the witness.
-2. `TallyVotesWithDifference`: Used during leader election, this function assesses whether a candidate has received subquorum votes.
+1. `TallyVotesWithDifference`: Used during leader election, this function assesses whether a candidate has received subquorum votes.
 
 ### Log Replication
-Leader replicates log entries to non-witness followers using the same mechanism as the original Raft algorithm. Similarly, the process of committing a log entry — triggered upon receiving quorum acknowledgments — remains consistent. However, we introduce a  modification: determining when a log entry should be "replicated" to the witness. Note that this replication does not involve transmitting actual data to the witness.
+Leader replicates log entries to non-witness followers using the same mechanism as the vanilla Raft algorithm. Similarly, the process of committing a log entry — triggered upon receiving quorum acknowledgments — remains consistent. However, we introduce a  modification: determining when a log entry should be "replicated" to the witness. Note that this replication does not involve transmitting actual data to the witness.
 
 The check for witness replication occurs within the `maybeCommit` function, just before invoking the `maybeCommit` function of the raftLog. Here’s how it works:
 
 1. The `ProgressTracker’s` `OneLessThanQuorumInReplicationSet` function is called. This function returns the index of the latest entry that has received subquorum acknowledgments. If the current configuration does not have a witness, the index will be 0.
-2. If a non-zero index is returned and the log entry has the same term and subterm as the current epoch, the leader attempts to replicate log entries up to this index with the witness. This is achieved via the `sendAppendToWitness` function. Notably, we've introduced specialized `sendXXXToWitness` functions for peers, as there’s no need to marshal witness messages.
-3. The witness processes this message and responds with a regular `MsgAppResp`, similar to how it handles other followers. Consequently, the leader can determine whether a log entry can be committed in the same manner as before.
+1. If a non-zero index is returned and the log entry has the same term and subterm as the current epoch, the leader attempts to replicate log entries up to this index with the witness. This is achieved via the `sendAppendToWitness` function. Notably, we've introduced specialized `sendXXXToWitness` functions for peers, as there’s no need to marshal witness messages.
+1. The witness processes this message and responds with a regular `MsgAppResp`, similar to how it handles other followers. Consequently, the leader can determine whether a log entry can be committed in the same manner as before.
+
+```go
+func (r *raft) maybeCommit() bool {
+  r.trk.Committed()
+  // check if we can commit on subquorum acks in current replication set
+  idxMap := r.trk.OneLessThanQuorumInReplicationSet()
+  for w, wci := range idxMap {
+    if wci > 0 {
+      e := r.raftLog.entry(uint64(wci))
+      if e.Term == r.Term && e.Subterm == r.trk.Epoch.Subterm {
+        // send MsgApp witness message with entry received subquorum acks
+        r.sendAppendToWitness(w, uint64(wci))
+      }
+    }
+  }
+
+  return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+}
+```
 
 ### Leader Election
 The adjustments to leader election are straightforward. Candidates continue to request votes from non-witness voters, following the established process. However, we introduce a new step: when a candidate has received subquorum votes, it requests votes from the witness.
@@ -98,13 +118,61 @@ We enhance the poll function by including an additional parameter called `votesT
 
 Candidates continuously monitor their vote differences as they poll the current voting status. When a candidate realizes that it requires only one additional vote to win the campaign, it sends a vote request to the witness. This request is made using the sendRequestVoteToWitness function, including the term, subterm, and the IDs of the followers who have already voted.
 
+```go
+func stepCandidate(r *raft, m pb.Message) error {
+  ...
+  
+	case myVoteRespType:
+
+  ...
+
+    // get remaining votes to win campaign
+    gr, rj, res, rv := r.pollAndReportDiff(m.From, m.Type, !m.Reject)  
+  
+  ...
+
+    case quorum.VotePending:
+      witnessReadyToVote := r.getWitnessVoteRequestReadiness(rv)
+      for witnessID, ready := range witnessReadyToVote {
+        if ready {
+          var myVoteType pb.MessageType
+          var term uint64
+          if r.state == StatePreCandidate {
+            myVoteType = pb.MsgPreVote
+            term = r.Term + 1
+          } else {
+            myVoteType = pb.MsgVote
+            term = r.Term
+          }
+          // candidate requests vote from witness
+          r.sendRequestVoteToWitness(nil, witnessID, myVoteType, term)
+        }
+      }
+
+  ...
+
+}
+```
+
 ### Witness Message Processing
+The `witness` class encapsulates the logic for handling witness messages in the extended Raft algorithm. This class utilizes simplified follower-only operations from Raft's `step` functions within its `Process` function to handle incoming witness messages. Upon successful processing, it generates a standard Raft response message, mimicking a real node.
 
-### Witness Abstraction
+The extended Raft algorithm presents "shortcut commit." This allows committing entries in current subterm based on acknowledgments from a subquorum of followers, provided the current subterm is already written to the witness. To minimize leader changes, the witness class, rather than the leader itself, handles shortcut commits. The witness class caches the latest successfully replicated subterm written to the witness. If an incoming MsgApp witness message matches this cached subterm, the witness class directly returns an acknowledgment.
 
+Multiple `witness` instances from different etcd nodes may potentially update the witness state in shared storage simultaneously. However, conflicts are rare because leader and candidate nodes only access the witness during fault events or campaigning.  To address this low-contention scenario, the witness class employs an optimistic concurrency scheme to write versioned states to persistent storage (via an abstract storage interface, which will be discussed later). This eliminates the need for locking mechanisms, improving performance and avoiding potential issues associated with using locks in network file systems like NFS or SMB shares.
+
+### Witness Storage Abstraction
+Any shared storage can act as a witness as long as it can fit into the optimistic concurency scheme. To perserve the flexibility, we abstract witness state I/O into interfaces (`WitnessState` and `WitnessStorage`) so that we an always implmenet new witness by implementing these interfaces.
+
+`WitnessStorage` is a state factory for a specific storage media. And `WitnessState` encapsulates a specific version of witness state data and is responsible for updating current state to a new state, giving no change was made in the middle. For each witness message being processed in `witness`, a new `WitnessState` object is loaded. Acompaning with the message, new states are calculated and tried to update to storage via the `WitnessState` object. 
 
 ### Membership Reconfiguration
 
+The `witness` class can utilize any shared storage that supports optimistic concurrency scheme. To maintain flexibility, we abstract witness state I/O into two interfaces: `WitnessState` and `WitnessStorage`. This allows for easy implementation of new witness backends by simply creating classes that adhere to these interfaces.
+
+`WitnessStorage` acts as a factory, responsible for creating `WitnessState` objects with latest states loaded from underlying persisted storage.
+`WitnessState` encapsulates a specific version of the witness state data. It provides methods for updating the current state to a new one, which will succeed if no concurrent modifications have occurred.
+During witness message processing, a new `WitnessState` object is loaded. New witness state information is then calculated and attempted to be written to storage using the loaded WitnessState object.
 
 ### Linearizable Read
 
@@ -318,7 +386,7 @@ In addition to comprehensive testing for legacy clusters, we've incorporated tes
 Furthermore, we've extended our testing to assess etcd's robustness in the event of witness failures. These in-depth tests simulate various fault scenarios to ensure etcd can gracefully handle witness disruptions and maintain cluster health.
 
 ### TLA+ Trace Validation
-There have been multiple formal specifications of raft consensus algorithm in TLA+, following Diego Ongaro's Ph.D. dissertation. However, no vesion aligns to the raft library implemented in etcd-io/raft, which we know are different from the original raft algorithm in some behaviors, e.g., reconfiguration.
+There have been multiple formal specifications of raft consensus algorithm in TLA+, following Diego Ongaro's Ph.D. dissertation. However, no vesion aligns to the raft library implemented in etcd-io/raft, which we know are different from the vanilla raft algorithm in some behaviors, e.g., reconfiguration.
 
 etcd and many other applications based on this raft library have been running good for long time, but we feel it would still be worthy to write a TLA+ spec for this specific implementation. It is not just to verify the correctness of the model, but also a foundation of a following up work in model-based trace validation.
 
@@ -333,7 +401,7 @@ Such mismatch implies two things: implementation issue, or out-of-dated model. I
 
 The work is currently under reviewing in etcd community ([TLA+ Trace validation](https://github.com/etcd-io/raft/pull/113)).
 
-We can extended the TLA+ trace validation for official raft to support extended raft algorithm to ensure the correct implementation in etcd-io/raft. 
+We can extended the TLA+ trace validation for vanilla raft to support extended raft algorithm to ensure the correct implementation in etcd-io/raft. 
 
 ### Metrics
 One of the key advantages of this design change is its transparency to existing monitoring setups. Since the core functionality of etcd remains unaltered, the metrics exposed by etcd continue to function identically. This ensures seamless integration with existing monitoring tools, such as Prometheus. You can continue to rely on the same etcd Prometheus metrics you're familiar with to gain insights into cluster health and performance.
@@ -341,7 +409,7 @@ One of the key advantages of this design change is its transparency to existing 
 # Case Study
 To evaluate the impact of witness functionality on cluster availability, we conducted benchmark tests using a two-node cluster with an SMB share as the witness. The cluster was subjected to a simulated workload, and key metrics were monitored to assess performance during fault scenarios.
 
-The results, as illustrated in the accompanying graphs, demonstrate that the cluster with a witness maintains similar or even slightly improved performance compared to the official version, while achieving comparable availability.
+The results, as illustrated in the accompanying graphs, demonstrate that the cluster with a witness maintains similar or even slightly improved performance compared to the vanilla version, while achieving comparable availability.
 
 When a follower node is intentionally brought down, both cluster configurations (with and without witness) exhibit 100% availability. However, the cluster utilizing a witness demonstrates a potential performance advantage. This is because, in this scenario, data only needs to be persisted on the leader node to be considered committed, streamlining the write process.
 
